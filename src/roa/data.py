@@ -1,6 +1,4 @@
-import os
 from pathlib import Path
-import pickle
 import warnings
 
 import numpy as np
@@ -33,16 +31,6 @@ CHANNELS_MAP = {
     9: 'IR_108',
     10: 'IR_120',
     11: 'IR_134'
-}
-
-CHANNELS_FCI2SEVIRI_MAP = {
-    'wv_63': 'WV_062',
-    'wv_73': 'WV_073',
-    'ir_87': 'IR_087',
-    'ir_97': 'IR_097',
-    'ir_105': 'IR_108',
-    'ir_123': 'IR_120',
-    'ir_133': 'IR_134'
 }
 
 TRAINING_SET_STATISTICS = {
@@ -184,7 +172,7 @@ def prepare_dataset_for_network(ds: xr.Dataset, fill_value: float=FILL_VALUE) ->
     x[torch.isnan(x)] = fill_value
     return x.float()
 
-    
+
 def to_latlon(ds: xr.Dataset, lonlat_res: float=LONLAT_RES, area_def_eqc: AreaDefinition=None) -> xr.Dataset:
     """
     Map data on the SEVIRI grid to a regular lat-lon grid.
@@ -220,7 +208,7 @@ def to_latlon(ds: xr.Dataset, lonlat_res: float=LONLAT_RES, area_def_eqc: AreaDe
         ]
         area_def_eqc = AreaDefinition(
                 area_id='eqc', description = 'Equidistant Cylindrical',
-                proj_id = 'eqc', projection = 'epsg:4326', 
+                proj_id = 'eqc', projection = 'epsg:4326',
                 width=x_size, height=y_size,
                 area_extent=area_extent
         )
@@ -280,7 +268,7 @@ def satellite_angles(lons_o: np.ndarray[np.float64], lats_o: np.ndarray[np.float
 
     # (Squared) eccentricity
     e2 = 1 - (b / a) ** 2
-    
+
     # Compute curvilinear geodetic coordinates for observer
     N_o = a / np.sqrt(1 - e2 * (np.sin(lats_o * D2R) ** 2))
     h_o = 0
@@ -329,11 +317,21 @@ class MSGNative:
         self.file = file
         self.reader = 'seviri_l1b_native'
 
-    def _read_data(
-        self,
-    ) -> xr.Dataset:
+
+    def get_dataset(self,
+                    area_extent: dict[str, int]={
+                        'x': np.arange(261 , 2865),
+                        'y': np.arange(511, 3199)
+                    }
+        ) -> xr.Dataset:
         """
-        Read the data with Satpy
+        Load the dataset and return the channels and satellite zenith angle.
+
+        Args:
+            area_extent: area extent to use, default is the region of interest.
+        
+        Returns:
+            Dataset with the channels and satellite zenith angle.
         """
         filenames = [self.file] if self.reader == 'seviri_l1b_native' else self.file
         scn = Scene(filenames=filenames, reader=self.reader)
@@ -347,43 +345,23 @@ class MSGNative:
                 scn['WV_062'].acq_time.reset_coords(names='acq_time').reset_coords(drop=True)
             )
         )
-        return ds
-
-    def get_dataset(self,
-                    area_extent: dict[str, int]={
-                        'x': np.arange(261 , 2565),
-                        'y': np.arange(511, 3199)
-                    }
-        ) -> xr.Dataset:
-        """
-        Load the dataset and return the channels and satellite zenith angle.
-
-        Args:
-            area_extent: area extent to use, default is the region of interest.
-        
-        Returns:
-            Dataset with the channels and satellite zenith angle.
-        """
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="^invalid value encountered in cast",
-                category=RuntimeWarning
-            )
-            ds = self._read_data()
+        acq_time = scn['WV_062'].acq_time
         if area_extent:
             ds = ds[{'y': area_extent['y'], 'x': area_extent['x']}]
+            acq_time = acq_time[{'y': area_extent['y']}]
+
+        missing_data = xr.concat([ds[name].isnull() for name in CHANNELS_MAP.values()],dim="channel").any(dim="channel")
+
         x, y = np.broadcast_arrays(ds.x.data.reshape(1, -1), ds.y.data.reshape(-1, 1))
         # Use arbitrary channel to obtain orbital parameters
         lons_o, lats_o = SEVIRI_0DEG_AREADEF.get_lonlat_from_projection_coordinates(x, y)
-        orbital_parameters = ds['WV_062'].attrs['orbital_parameters']
+        orbital_parameters = scn['WV_062'].attrs['orbital_parameters']
         satellite_zenith = satellite_angles(
             lons_o,
             lats_o,
-            # At least files for 2012-12-08 lack the 'actual satellite' position, so we fall back to the nominal one in that case
-            orbital_parameters['satellite_actual_longitude'] if 'satellite_actual_longitude' in orbital_parameters else orbital_parameters['satellite_nominal_longitude'],
-            orbital_parameters['satellite_actual_latitude'] if 'satellite_actual_latitude' in orbital_parameters else orbital_parameters['satellite_nominal_latitude'],
-            orbital_parameters['satellite_actual_altitude'] if 'satellite_actual_altitude' in orbital_parameters else orbital_parameters['projection_altitude'],
+            orbital_parameters['satellite_actual_longitude'],
+            orbital_parameters['satellite_actual_latitude'],
+            orbital_parameters['satellite_actual_altitude'],
             SEVIRI_0DEG_PROJ4['a'],
             SEVIRI_0DEG_PROJ4['a'] * (1 - 1 / SEVIRI_0DEG_PROJ4['rf'])
         )[1].astype(np.float32)
@@ -392,16 +370,20 @@ class MSGNative:
                 ds,
                 xr.Dataset(
                     data_vars={
-                        'satellite_zenith': (("y", "x"), satellite_zenith)
+                        'satellite_zenith': (("y", "x"), satellite_zenith),
+                        'missing_data': (("y", "x"), missing_data.data),
+                        'aquisition_time': (("y"), acq_time.data),
                     },
                     coords={
                         "x": ds.x.data,
-                        "y": ds.y.data
+                        "y": ds.y.data,
+                        "longitude": (("y", "x"), lons_o.astype(np.float32)),
+                        "latitude": (("y", "x"), lats_o.astype(np.float32)),
                     }
                 )
             )
         )
-    
+
 
 class MSGHRIT(MSGNative):
     """
@@ -420,92 +402,6 @@ class MSGHRIT(MSGNative):
     def __init__(self, file: list[str]):
         self.file = file
         self.reader = 'seviri_l1b_hrit'
-
-
-class FCI2SEVIRI(MSGNative):
-    """
-    Class to load FCI data and map it to SEVIRI, emulating MSGNative
-    """
-    def __init__(self, file: list[str] | list[Path]):
-        assert isinstance(file, list)
-        assert len(file) == 40
-        assert all(str(f).endswith('.nc') for f in file)
-
-        self.file = file
-        self.reader = 'fci_l1c_nc'
-
-    def _read_data(
-        self,
-    ) -> xr.Dataset:
-        """
-        Read the data with Satpy and map it to SEVIRI, since we emulate MSGNative.
-        """
-        scn = Scene(filenames=self.file, reader=self.reader)
-        scn.load(CHANNELS_FCI2SEVIRI_MAP.keys())
-        scn.load([f'{v}_time' for v in CHANNELS_FCI2SEVIRI_MAP.keys()])
-        # Get the acquisition time:
-        time_offset = np.datetime64('2000')
-        time_array = np.stack(
-            [
-                scn[f'{v}_time'].astype('timedelta64[s]') + time_offset
-                for v in CHANNELS_FCI2SEVIRI_MAP.keys()
-            ],
-            axis=-1
-        )
-        # Assume all channels have the same time, handling NaTs
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="All-NaN slice encountered",
-                category=RuntimeWarning
-            )
-            time_array = np.nanmin(time_array, axis=-1)
-            time_array = xr.DataArray(
-                time_array.astype('datetime64[ns]'),
-                coords={
-                    # Arbitrary channel to obtain coordinates
-                    'y': scn['wv_63'].y.data,
-                    'x': scn['wv_63'].x.data
-                },
-                dims=('y', 'x'),
-                name='acq_time'
-            )
-        ds = xr.merge(
-            (
-                xr.merge(
-                    [
-                        scn[name_fci].reset_coords(drop=True).to_dataset(name=name_seviri)
-                        for name_fci, name_seviri in CHANNELS_FCI2SEVIRI_MAP.items()
-                    ]
-                ),
-                time_array.reset_coords(drop=True)
-            )
-        )
-        # Now map the data to SEVIRI grid
-        if 'FCI2SEVIRI_NEAREST_NEIGHBOUR_LINESAMPLE_ARRAYS' in os.environ:
-            with open(os.environ['FCI2SEVIRI_NEAREST_NEIGHBOUR_LINESAMPLE_ARRAYS'], 'rb') as handle:
-                idx_row_map, idx_col_map, mask_invalid = pickle.load(handle)
-        else:
-            from roa.utils import fci2seviri_generate_nearest_neighbour_linesample_arrays
-            idx_row_map, idx_col_map, mask_invalid = fci2seviri_generate_nearest_neighbour_linesample_arrays(
-                None
-            )
-        
-        data_vars = {}
-        for var_name in ds.data_vars:
-            data_array = ds[var_name].values
-            # Use advanced numpy indexing, using xarray indexing results much more slow
-            resampled_data = data_array[idx_row_map.values, idx_col_map.values]
-            data_vars[var_name] = (('y', 'x'), resampled_data)
-        
-        ds_resampled = xr.Dataset(data_vars=data_vars, coords=mask_invalid.coords).where(~mask_invalid)
-
-        # Preserve attributes
-        for var_name in ds_resampled.variables:
-            ds_resampled[var_name].attrs = ds[var_name].attrs
-        ds_resampled.attrs = ds.attrs
-
-        return ds_resampled
 
 
 class MSGDataset(Dataset):
@@ -540,14 +436,14 @@ class MSGDataset(Dataset):
         self.transforms_reference = transforms.Compose([transforms.ToTensor()])
         if area_extent:
             raise NotImplementedError
-        
+
         self.train = train
         if self.train:
             self.gpm_precip = True
-    
+
     def __len__(self):
         return len(self.files)
-    
+
     def __getitem__(self, idx):
         with xr.open_dataset(self.files[idx]) as ds:
             if self.grid:
@@ -564,31 +460,31 @@ class MSGDataset(Dataset):
                 x = prepare_dataset_for_network(to_latlon(ds), fill_value=self.fill_value)
             else:
                 x = prepare_dataset_for_network(ds, fill_value=self.fill_value)
-        
+
         if self.gpm_precip:
             y = self.transforms_reference(ds["gpm_precip"].values)
 
             if self.train:
                 x, y = self._data_augmentation(x, y)
-            
+
             if self.grid:
                 return x, y, xx, yy
             else:
                 return x, y
-        
+
         if self.grid:
             return x, xx, yy
         else:
             return x
-    
+
     def _data_augmentation(self, x, y):
         # Random number generator
         rng = np.random.default_rng()
-        
+
         # Pick rotation
         deg = rng.choice([0, 90, 180, 270])
         rotation = transforms.RandomRotation(degrees=(deg, deg))
-        
+
         # Pick probabilities to flip
         p_flip_h = rng.choice([0, 1])
         flip_h = transforms.RandomHorizontalFlip(p=p_flip_h)
@@ -605,7 +501,7 @@ class MSGDataset(Dataset):
         y = transforms.functional.crop(da_transforms(y), i, j, h, w)
 
         return x, y
-    
+
 
 class GPM:
     """
@@ -647,7 +543,6 @@ class GPM:
         )
         self.resampled = True
 
-
 class GPM2BCMB:
     """
    Class to load GPM 2BCMB data without pansat.
@@ -657,7 +552,7 @@ class GPM2BCMB:
     """
     def __init__(self, file_path: Path | str) -> None:
         self.file_path = Path(file_path)
-    
+
     def read(self, variables: list=['nearSurfPrecipTotRate']) -> xr.Dataset:
         variables = variables + ['Latitude', 'Longitude']
         ds = xr.open_dataset(self.file_path, group='KuGMI')[set(variables)]
@@ -694,3 +589,6 @@ class GPM2BCMB:
                 np.datetime64(f"{d[0]}-{d[1]:02d}-{d[2]:02d}T{d[3]:02d}:{d[4]:02d}:{d[5]:02d}.{d[6]:03d}") + dt
             )
         return xr.DataArray(np.array(dates).astype('datetime64[ns]'), dims=ds.dims, name='timestamp').to_dataset()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      592,1         Bot
+
+
